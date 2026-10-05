@@ -7,13 +7,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -129,57 +127,65 @@ func UsersWithContext(ctx context.Context) ([]UserStat, error) {
 	return ret, nil
 }
 
-type loginctlSession struct {
-	Session string `json:"session"`
-}
-
+// usersFromLoginctlWithContext lists logged-in users through systemd-logind.
+// It is used when utmp is not available. The plain column output of
+// list-sessions is parsed on purpose: -o json is ignored since systemd 256 and
+// --json only exists from 256 on, while the first column has been the session
+// id in every version.
 func usersFromLoginctlWithContext(ctx context.Context) ([]UserStat, error) {
-	out, err := invoke.CommandWithContext(ctx, "loginctl", "list-sessions", "-o", "json")
+	ctx, cancel := context.WithTimeout(ctx, common.Timeout)
+	defer cancel()
+
+	out, err := invoke.CommandWithContext(ctx, "loginctl", "list-sessions", "--no-legend", "--no-pager")
 	if err != nil {
 		return nil, err
 	}
 
-	var sessions []loginctlSession
-	if err := json.Unmarshal(out, &sessions); err != nil {
-		return nil, err
-	}
-
-	type sessionResult struct {
-		stat UserStat
-		err  error
-	}
-
-	results := make([]sessionResult, len(sessions))
-	var wg sync.WaitGroup
-	for i, s := range sessions {
-		wg.Add(1)
-		go func(i int, id string) {
-			defer wg.Done()
-			stat, err := loginctlShowSessionWithContext(ctx, id)
-			results[i] = sessionResult{stat: stat, err: err}
-		}(i, s.Session)
-	}
-	wg.Wait()
-
-	ret := make([]UserStat, 0, len(sessions))
-	for _, r := range results {
-		if r.err != nil {
+	var ids []string
+	for _, line := range strings.Split(string(out), "\n") {
+		// The session column is right-aligned, so use Fields to drop padding.
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
 			continue
 		}
-		ret = append(ret, r.stat)
+		ids = append(ids, fields[0])
+	}
+
+	ret := make([]UserStat, 0, len(ids))
+	var lastErr error
+	failed := 0
+	for _, id := range ids {
+		stat, ok, err := loginctlShowSessionWithContext(ctx, id)
+		if err != nil {
+			// Sessions can close between list-sessions and show-session.
+			lastErr = err
+			failed++
+			continue
+		}
+		if ok {
+			ret = append(ret, stat)
+		}
+	}
+	if len(ids) > 0 && failed == len(ids) {
+		return nil, lastErr
 	}
 
 	return ret, nil
 }
 
-func loginctlShowSessionWithContext(ctx context.Context, id string) (UserStat, error) {
+// loginctlShowSessionWithContext returns the session as a UserStat. The bool is
+// false for sessions that utmp would not have listed as USER_PROCESS: those whose
+// class does not start with "user" (e.g. "manager", "greeter") or that have
+// neither a seat nor a tty.
+func loginctlShowSessionWithContext(ctx context.Context, id string) (UserStat, bool, error) {
 	out, err := invoke.CommandWithContext(ctx, "loginctl", "show-session", id,
-		"-p", "Name", "-p", "TTY", "-p", "RemoteHost", "-p", "Timestamp")
+		"-p", "Name", "-p", "TTY", "-p", "RemoteHost", "-p", "Timestamp", "-p", "Class", "-p", "Seat")
 	if err != nil {
-		return UserStat{}, err
+		return UserStat{}, false, err
 	}
 
 	var stat UserStat
+	var class, seat string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		key, value, found := strings.Cut(line, "=")
 		if !found {
@@ -192,14 +198,27 @@ func loginctlShowSessionWithContext(ctx context.Context, id string) (UserStat, e
 			stat.Terminal = value
 		case "RemoteHost":
 			stat.Host = value
+		case "Class":
+			class = value
+		case "Seat":
+			seat = value
 		case "Timestamp":
-			if t, err := time.Parse("Mon 2006-01-02 15:04:05 MST", value); err == nil {
-				stat.Started = int(t.Unix())
+			// Format: "Mon 2026-01-22 14:51:57 CET". The zone abbreviation can be
+			// numeric (e.g. +0330), which time.Parse rejects, so only read the wall
+			// clock and interpret it in the local zone.
+			if f := strings.Fields(value); len(f) >= 3 {
+				if t, err := time.ParseInLocation("2006-01-02 15:04:05", f[1]+" "+f[2], time.Local); err == nil {
+					stat.Started = int(t.Unix())
+				}
 			}
 		}
 	}
 
-	return stat, nil
+	if !strings.HasPrefix(class, "user") || (seat == "" && stat.Terminal == "") {
+		return UserStat{}, false, nil
+	}
+
+	return stat, true, nil
 }
 
 func getlsbStruct(ctx context.Context) (*lsbStruct, error) {
